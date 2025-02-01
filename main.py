@@ -1,130 +1,121 @@
-import os
-import pandas as pd
-import openai
-import faiss
-import numpy as np
 import requests
+import os
+from langchain.agents import Tool, AgentExecutor, ZeroShotAgent
+from langchain.tools import tool
+from langchain.chat_models import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+import openai
+from langchain.memory import ConversationBufferMemory
+from config.settings import Settings
+from tools.googleTrendsTool import GoogleTrendsTool
+from tools.vectorSearchTool import *
+from tools.weatherTool import WeatherTool
 import streamlit as st
-import psutil
-import time
 
-# API 키 보호 (환경변수 사용 권장)
-OPENWEATHER_API_KEY = "****"
-OPENAI_API_KEY = "****"
-openai.api_key = OPENAI_API_KEY
+st.set_page_config(page_title="Fashion Recommendation Chatbot", layout="wide")
+st.title("👗 패션 추천 챗봇")
 
-# OpenWeatherMap API URL 설정
-CITY = "Seoul"
-WEATHER_API_URL = f"http://api.openweathermap.org/data/2.5/weather?q={CITY}&appid={OPENWEATHER_API_KEY}&units=metric"
+weather = WeatherTool(Settings.WEATHER_API_KEY, city='Seoul')
+google_trends = GoogleTrendsTool()
 
-# 미리 로드할 CSV 및 FAISS 인덱스 파일 경로
-DATA_PATH = "proff.csv"
-INDEX_PATH = "fashion.index"
+# LangChain Tool 정의
+@tool
+def vectordb_tool(user_request):
+    """Search for fashion recommendations based on user requests and return set-based recommendations."""
+    return search(user_request)
 
-def get_weather_data():
-    """현재 날씨 정보를 가져오는 함수"""
-    response = requests.get(WEATHER_API_URL)
-    weather_data = response.json()
-    return {
-        "temperature": weather_data["main"]["temp"],
-        "wind_speed": weather_data["wind"]["speed"],
-        "precipitation": weather_data.get("rain", {}).get("1h", 0)
-    }
+@tool
+def weather_tool(city: str) -> str:
+    """Get the current weather data based on the specified city."""
+    return weather.get_weather()
 
-def create_or_load_faiss_index():
-    """FAISS 인덱스를 로드하거나 새롭게 생성하는 함수"""
-    if os.path.exists(INDEX_PATH):
-        df = pd.read_csv(DATA_PATH)
-        index = faiss.read_index(INDEX_PATH)
+@tool
+def google_trends_tool(user_request: str) -> str:
+    """Retrieve the latest trends from Google based on the given keyword."""
+    return google_trends.get_trends(keywords=user_request)
+
+tools = [
+    Tool(name="RAG VectorDB Query", func=vectordb_tool, description="Queries the Fashion database."),
+    Tool(name="Weather Data", func=weather_tool, description="Fetches data from Weather API."),
+    Tool(name="Trends Data", func=google_trends_tool, description="Fetches data from Google Trends API.")
+]
+
+prompt = ChatPromptTemplate.from_messages([
+    (
+        """
+        "system" : You are a fashion expert. Provide recommendations based on trends and always consider the weather according to the request.
+        Adhere to the following conditions.
+            Always respond in Korean.
+            Always take the weather into account.
+            Always Use weather_tool, google_trends_tool.
+            Always use polite and gentle language.
+            Recommend 2 to 3 combinations.
+            Utilize all available tools to respond to the request.
+            Include combinations such as tops, bottoms, and other items in your response.
+        """
+    ),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{input}"),
+    MessagesPlaceholder(variable_name="agent_scratchpad")
+])
+
+memory = ConversationBufferMemory(memory_key="chat_history")
+
+# LangChain Agent 초기화
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.6, max_tokens=1500,)
+agent = ZeroShotAgent.from_llm_and_tools(llm=llm, tools=tools, prompt=prompt)
+
+agent_executor = AgentExecutor(
+    agent=agent,
+    tools=tools,
+    verbose=True,
+    memory=memory,
+    handle_parsing_errors=True
+)
+
+# Agent 실행
+# def run_agent():
+#     print("LangChain Agent 시작! 'exit'를 입력하면 종료됩니다.")
+#     while True:
+#         user_request = input("요청을 입력하세요: ")
+#         if user_request.lower() in ["exit", "quit", '종료']:
+#             print("Agent 종료.")
+#             break
+
+#         # response = agent.run(user_request)
+#         response = agent_executor.invoke({'input' : f'{user_request}'})
+#         print("\n응답:\n")
+#         print(response)
+
+# if __name__ == "__main__":
+#     run_agent()
+
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
+
+with st.container():
+    user_request = st.text_input("패션 추천 요청을 입력하세요:", key="user_request")
+    if st.button("추천받기"):
+        if user_request.strip():
+            # 사용자 요청 처리
+            response = agent_executor.invoke({'input' : f'{user_request}'})
+
+            # 'output' 키의 내용만 출력하도록 처리
+            if isinstance(response, dict) and "output" in response:
+                response_content = response["output"]
+            else:
+                response_content = response
+
+            # 대화 기록 저장
+            st.session_state["messages"].append({"role": "user", "content": user_request})
+            st.session_state["messages"].append({"role": "assistant", "content": response_content})
+
+        else:
+            st.warning("요청을 입력하세요!")
+
+# 대화 기록 표시
+for msg in st.session_state["messages"]:
+    if msg["role"] == "user":
+        st.markdown(f"**👤 사용자:** {msg['content']}")
     else:
-        df = pd.read_csv(DATA_PATH)
-        required_columns = {"스타일", "카테고리", "색상", "기장", "소재", "핏"}
-        if not required_columns.issubset(df.columns):
-            raise ValueError("CSV 파일에 필요한 열이 없습니다. '스타일', '카테고리', '색상', '기장', '소재', '핏' 열이 포함되어야 합니다.")
-        
-        df['embedding_text'] = df.apply(lambda x: f"{x['스타일']} {x['카테고리']} {x['색상']} {x['기장']} {x['소재']} {x['핏']}", axis=1)
-        embeddings = [
-            openai.Embedding.create(input=text, model="text-embedding-ada-002")['data'][0]['embedding']
-            for text in df['embedding_text']
-        ]
-
-        embeddings = np.array(embeddings).astype("float32")
-        index = faiss.IndexFlatL2(embeddings.shape[1])
-        index.add(embeddings)
-        faiss.write_index(index, INDEX_PATH)
-    
-    return df, index
-
-def recommend_fashion(user_request, df, index):
-    """사용자의 요청을 기반으로 적절한 패션을 추천하는 함수"""
-
-    # 사용자 요청 임베딩 생성
-    response = openai.Embedding.create(input=user_request, model="text-embedding-ada-002")
-    user_embedding = np.array(response['data'][0]['embedding']).astype("float32").reshape(1, -1)
-    D, I = index.search(user_embedding, k=10)
-    recommendations = df.iloc[I[0]].to_dict(orient="records")
-
-    weather_data = get_weather_data()
-    
-    # 추천 조합 생성
-    tops, bottoms, dresses, outerwears = [], [], [], []
-    for rec in recommendations:
-        category = rec['카테고리']
-        if category == "드레스":
-            dresses.append(rec)
-        elif category == "상의":
-            tops.append(rec)
-        elif category == "하의":
-            bottoms.append(rec)
-        elif category == "아우터":
-            outerwears.append(rec)
-
-    # 추천 메시지 생성
-    prompt = f"현재 날씨는 기온 {weather_data['temperature']}°C, 바람 {weather_data['wind_speed']} m/s, 강수량 {weather_data['precipitation']} mm 입니다.\n"
-    prompt += f"사용자가 '{user_request}' 라고 요청했습니다.\n\n추천 조합:\n"
-
-    if dresses:
-        for dress in dresses:
-            prompt += f"- 드레스: {dress['스타일']}, 색상: {dress['색상']}, 소재: {dress['소재']}, 핏: {dress['핏']}\n"
-            if outerwears:
-                prompt += "  아우터 포함:\n"
-                for outer in outerwears:
-                    prompt += f"  - {outer['스타일']}, 색상: {outer['색상']}, 소재: {outer['소재']}, 핏: {outer['핏']}\n"
-    elif tops and bottoms:
-        for top in tops:
-            prompt += f"- 상의: {top['스타일']}, 색상: {top['색상']}, 소재: {top['소재']}, 핏: {top['핏']}\n"
-            for bottom in bottoms:
-                prompt += f"  하의: {bottom['스타일']}, 색상: {bottom['색상']}, 소재: {bottom['소재']}, 핏: {bottom['핏']}\n"
-            if outerwears:
-                prompt += "  아우터 포함:\n"
-                for outer in outerwears:
-                    prompt += f"  - {outer['스타일']}, 색상: {outer['색상']}, 소재: {outer['소재']}, 핏: {outer['핏']}\n"
-
-    # LLM을 사용하여 최종 추천 생성
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": "You are a helpful fashion recommendation assistant."},
-                  {"role": "user", "content": prompt}],
-        max_tokens=700
-    )
-    
-    return response['choices'][0]['message']['content'].strip()
-
-# Streamlit 앱 시작
-st.title("날씨 기반 RAG 패션 추천 시스템")
-
-user_request = st.text_input("패션 추천 요청을 입력하세요 (예: '오늘 날씨에 맞는 캐주얼한 옷을 추천해줘')")
-
-try:
-    df, index = create_or_load_faiss_index()
-except Exception as e:
-    st.error(f"데이터 로드 중 오류 발생: {e}")
-    st.stop()
-
-if st.button("추천 받기"):
-    if user_request:
-        recommendation = recommend_fashion(user_request, df, index)
-        st.subheader("추천 결과")
-        st.write(recommendation)
-    else:
-        st.warning("추천 요청을 입력하세요.")
+        st.markdown(f"**🤖 추천봇:** {msg['content']}")
